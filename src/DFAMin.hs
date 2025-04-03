@@ -4,19 +4,19 @@
 
 module DFAMin (minimizeDFA) where
 
-import AbsSyn
+import           AbsSyn
 
-import Data.IntMap ( IntMap )
-import Data.IntSet ( IntSet )
-import Data.Map    ( Map )
+import           Data.IntMap (IntMap)
+import           Data.IntSet (IntSet)
+import           Data.Map    (Map)
 #if !MIN_VERSION_containers(0,6,0)
-import Data.Maybe  ( mapMaybe )
+import           Data.Maybe  (mapMaybe)
 #endif
 
-import qualified Data.Map    as Map
-import qualified Data.IntSet as IntSet
 import qualified Data.IntMap as IntMap
+import qualified Data.IntSet as IntSet
 import qualified Data.List   as List
+import qualified Data.Map    as Map
 
 -- % Hopcroft's Algorithm for DFA minimization (cut/pasted from Wikipedia):
 -- % X refines Y into Y1 and Y2 means
@@ -108,7 +108,7 @@ minimizeDFA  dfa@(DFA { dfa_start_states = starts,
 
       fix_rctxt :: RightContext SNum -> RightContext SNum
       fix_rctxt (RightContextRExp s) = RightContextRExp (get_new s)
-      fix_rctxt other = other
+      fix_rctxt other                = other
 
       lookup :: Ord k => Map k v -> k -> v
       lookup m k = Map.findWithDefault (error "minimizeDFA") k m
@@ -124,7 +124,7 @@ type EquivalenceClass = IntSet
 
 groupEquivStates :: forall a. Ord a => DFA Int a -> [EquivalenceClass]
 groupEquivStates DFA { dfa_states = statemap }
-  = go init_r init_q
+  = go (init_r ++ init_q) init_q
   where
     accepting, nonaccepting :: Map Int (State Int a)
     (accepting, nonaccepting) = Map.partition acc statemap
@@ -165,7 +165,7 @@ groupEquivStates DFA { dfa_states = statemap }
     -- The outer loop: recurse on each set in R and Q
     go :: [EquivalenceClass] -> [EquivalenceClass] -> [EquivalenceClass]
     go r [] = r
-    go r (a:q) = uncurry go $ List.foldl' go0 (a:r,q) xs
+    go r (a:q) = uncurry go $ List.foldl' go0 (r,q) xs
       where
         preimage :: IntMap EquivalenceClass -- inversed transition function
                  -> EquivalenceClass        -- subset of codomain of original transition function
@@ -196,21 +196,17 @@ groupEquivStates DFA { dfa_states = statemap }
             y1 = IntSet.intersection y x
             y2 = IntSet.difference   y x
 
-        go0 (r,q) x = go1 r [] []
+        go0 (r,q) x = go1 r [] q
           where
             -- iterates over R
-            go1 []    r' q' = (r', go2 q q')
+            go1 []    r' q' = (r', q')
             go1 (y:r) r' q' = case refineWith x y of
               Nothing                       -> go1 r (y:r') q'
               Just (y1, y2)
-                | IntSet.size y1 <= IntSet.size y2 -> go1 r (y2:r') (y1:q')
-                | otherwise                        -> go1 r (y1:r') (y2:q')
+                | y `elem` q                       -> go1 r (y1:y2:r') (y1:y2: (q' List.\\ [y]))
+                | IntSet.size y1 <= IntSet.size y2 -> go1 r (y1:y2:r') (y1:q')
+                | otherwise                        -> go1 r (y1:y2:r') (y2:q')
 
-            -- iterates over Q
-            go2 []    q' = q'
-            go2 (y:q) q' = case refineWith x y of
-              Nothing       -> go2 q (y:q')
-              Just (y1, y2) -> go2 q (y1:y2:q')
 
 -- To pacify GHC 9.8's warning about 'head'
 headWithDefault :: a -> [a] -> a
