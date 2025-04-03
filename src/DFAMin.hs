@@ -1,22 +1,32 @@
-{-# OPTIONS_GHC -fno-warn-name-shadowing #-}
-
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE BlockArguments   #-}
+{-# LANGUAGE CPP              #-}
+{-# LANGUAGE FlexibleContexts #-}
+{-# LANGUAGE MultiWayIf       #-}
 
 module DFAMin (minimizeDFA) where
 
-import AbsSyn
+import           AbsSyn
 
-import Data.IntMap ( IntMap )
-import Data.IntSet ( IntSet )
-import Data.Map    ( Map )
+import           Data.IntMap         (IntMap)
+import           Data.IntSet         (IntSet)
+import           Data.Map            (Map)
 #if !MIN_VERSION_containers(0,6,0)
-import Data.Maybe  ( mapMaybe )
+import           Data.Maybe          (mapMaybe)
 #endif
 
-import qualified Data.Map    as Map
-import qualified Data.IntSet as IntSet
-import qualified Data.IntMap as IntMap
-import qualified Data.List   as List
+import qualified Data.IntMap         as IntMap
+import qualified Data.IntSet         as IntSet
+import qualified Data.List           as List
+import qualified Data.Map            as Map
+
+import           Control.Monad.Loops
+import qualified Control.Monad.State as S
+
+import           Control.Monad       (guard)
+import           Data.Traversable    (for)
+
+import           Debug.Trace
+
 
 -- % Hopcroft's Algorithm for DFA minimization (cut/pasted from Wikipedia):
 -- % X refines Y into Y1 and Y2 means
@@ -108,7 +118,7 @@ minimizeDFA  dfa@(DFA { dfa_start_states = starts,
 
       fix_rctxt :: RightContext SNum -> RightContext SNum
       fix_rctxt (RightContextRExp s) = RightContextRExp (get_new s)
-      fix_rctxt other = other
+      fix_rctxt other                = other
 
       lookup :: Ord k => Map k v -> k -> v
       lookup m k = Map.findWithDefault (error "minimizeDFA") k m
@@ -121,96 +131,93 @@ minimizeDFA  dfa@(DFA { dfa_start_states = starts,
                                           s <- IntSet.toList ss ]
 
 type EquivalenceClass = IntSet
+type HopcroftM = S.State ([EquivalenceClass], [EquivalenceClass])
 
 groupEquivStates :: forall a. Ord a => DFA Int a -> [EquivalenceClass]
-groupEquivStates DFA { dfa_states = statemap }
-  = go init_r init_q
+groupEquivStates DFA { dfa_states = statemap } =
+  fst $ S.execState go (initialSets, initialSets)
   where
-    accepting, nonaccepting :: Map Int (State Int a)
-    (accepting, nonaccepting) = Map.partition acc statemap
-       where acc (State as _) = not (List.null as)
+    -- Initial P and W sets as defined in Hopcroft's algorithm.
+    -- They are each composed of two inner sets: the sets of all accepting
+    -- states (F), and the set of all non-accepting states (Q \ F).
+    initialSets :: [EquivalenceClass]
+    initialSets = Map.elems $ Map.fromListWith IntSet.union do
+      (index, stateInfo) <- Map.toList statemap
+      pure (state_acc stateInfo, IntSet.singleton index)
 
-    nonaccepting_states :: EquivalenceClass
-    nonaccepting_states = IntSet.fromList (Map.keys nonaccepting)
+    -- To each token c in Σ, this map contains a reverse map of transitions.
+    -- That is, for each c, we have a map that, to a state s, associate the set
+    -- of states that can reach s via c.
+    reverseTransitionCache :: [IntMap EquivalenceClass]
+    reverseTransitionCache = IntMap.elems $
+      IntMap.fromListWith (IntMap.unionWith IntSet.union) do
+        (startingState, stateInfo) <- Map.toList statemap
+        (token, targetState) <- IntMap.toList $ state_out stateInfo
+        pure (token, IntMap.singleton targetState $ IntSet.singleton startingState)
 
-    -- group the accepting states into equivalence classes
-    accept_map :: Map [Accept a] [Int]
-    accept_map = {-# SCC "accept_map" #-}
-      List.foldl' (\m (n,s) -> Map.insertWith (++) (state_acc s) [n] m)
-             Map.empty
-             (Map.toList accepting)
-
-    accept_groups :: [EquivalenceClass]
-    accept_groups = map IntSet.fromList (Map.elems accept_map)
-
-    init_r, init_q :: [EquivalenceClass]
-    init_r  -- Issue #71: each EquivalenceClass needs to be a non-empty set
-      | IntSet.null nonaccepting_states = []
-      | otherwise                   = [nonaccepting_states]
-    init_q = accept_groups
-
-    -- a map from token T to
-    --   a map from state S to the set of states that transition to
-    --   S on token T
-    -- bigmap is an inversed transition function classified by each input token.
-    -- the codomain of each inversed function is a set of states rather than single state
-    -- since a transition function might not be an injective.
-    -- This is a cache of the information needed to compute xs below
-    bigmap :: IntMap (IntMap EquivalenceClass)
-    bigmap = IntMap.fromListWith (IntMap.unionWith IntSet.union)
-                [ (i, IntMap.singleton to (IntSet.singleton from))
-                | (from, state) <- Map.toList statemap,
-                  (i,to) <- IntMap.toList (state_out state) ]
-
-    -- The outer loop: recurse on each set in R and Q
-    go :: [EquivalenceClass] -> [EquivalenceClass] -> [EquivalenceClass]
-    go r [] = r
-    go r (a:q) = uncurry go $ List.foldl' go0 (a:r,q) xs
-      where
-        preimage :: IntMap EquivalenceClass -- inversed transition function
-                 -> EquivalenceClass        -- subset of codomain of original transition function
-                 -> EquivalenceClass        -- preimage of given subset
+    -- Given an IntMap and an IntSet, restrict the IntMap to the keys that are
+    -- within the IntSet.
+    restrictKeys :: forall a. IntMap a -> IntSet -> IntMap a
+    restrictKeys m s =
 #if MIN_VERSION_containers(0,6,0)
-        preimage invMap = IntSet.unions . IntMap.restrictKeys invMap
+      IntMap.restrictKeys m s
 #else
-        preimage invMap = IntSet.unions . mapMaybe (`IntMap.lookup` invMap) . IntSet.toList
+      IntMap.filterWithKey (\k _ -> k `IntSet.member` s) m
 #endif
 
-        xs :: [EquivalenceClass]
-        xs =
-          [ x
-          | invMap <- IntMap.elems bigmap
-          , let x = preimage invMap a
-          , not (IntSet.null x)
-          ]
+    -- Given a set of states A, compute X for each c in Σ.
+    -- For a given c, X is the set of states that can reach A via c.
+    -- We use the precomputed 'reverseTransitionCache'.
+    computeAllXs :: EquivalenceClass -> [EquivalenceClass]
+    computeAllXs a = do
+      allPreviousStates <- reverseTransitionCache
+      let filteredPreviousStates = IntSet.unions $ restrictKeys allPreviousStates a
+      guard $ not $ IntSet.null filteredPreviousStates
+      pure filteredPreviousStates
 
-        refineWith
-          :: EquivalenceClass -- preimage set that bisects the input equivalence class
-          -> EquivalenceClass -- input equivalence class
-          -> Maybe (EquivalenceClass, EquivalenceClass) -- refined equivalence class
-        refineWith x y =
-          if IntSet.null y1 || IntSet.null y2
-            then Nothing
-            else Just (y1, y2)
-          where
-            y1 = IntSet.intersection y x
-            y2 = IntSet.difference   y x
+    -- Given two sets X and Y, compute their intersection and difference.
+    -- Only returns both if both are non-empty, otherwise return neither.
+    refine
+      :: EquivalenceClass
+      -> EquivalenceClass
+      -> Maybe (EquivalenceClass, EquivalenceClass)
+    refine x y =
+      let intersection = IntSet.intersection y x
+          difference   = IntSet.difference   y x
+      in if IntSet.null intersection || IntSet.null difference
+        then Nothing
+        else Just (intersection, difference)
 
-        go0 (r,q) x = go1 r [] []
-          where
-            -- iterates over R
-            go1 []    r' q' = (r', go2 q q')
-            go1 (y:r) r' q' = case refineWith x y of
-              Nothing                       -> go1 r (y:r') q'
-              Just (y1, y2)
-                | IntSet.size y1 <= IntSet.size y2 -> go1 r (y2:r') (y1:q')
-                | otherwise                        -> go1 r (y1:r') (y2:q')
+    -- Attempt to unpack an A from W.
+    unpackA :: HopcroftM (Maybe EquivalenceClass)
+    unpackA = do
+      w <- getW
+      for (List.uncons w) \(a, newW) -> do
+        setW newW
+        pure a
 
-            -- iterates over Q
-            go2 []    q' = q'
-            go2 (y:q) q' = case refineWith x y of
-              Nothing       -> go2 q (y:q')
-              Just (y1, y2) -> go2 q (y1:y2:q')
+    -- Main outer loop of the algorithm: we iterate until W is empty.
+    go :: HopcroftM ()
+    go =
+      whileJust_ unpackA \a ->
+        for (computeAllXs a) \x -> do
+          p <- getP
+          newPs <- for p \y ->
+            case refine x y of
+              Nothing       -> pure [y]
+              Just (y1, y2) -> do
+                w <- getW
+                if | y `List.elem` w                  -> setW $ y1 : y2 : (w List.\\ [y])
+                   | IntSet.size y1 <= IntSet.size y2 -> setW $ y1 : w
+                   | otherwise                        -> setW $ y2 : w
+                pure [y1, y2]
+          setP $ concat newPs
+
+    getP = S.gets fst
+    getW = S.gets snd
+    setP p = S.modify \(_, w) -> (p, w)
+    setW w = S.modify \(p, _) -> (p, w)
+
 
 -- To pacify GHC 9.8's warning about 'head'
 headWithDefault :: a -> [a] -> a
