@@ -33,7 +33,7 @@ jobs:
         githubToken: ${{ github.token }}
         install: |
           apt-get update -y
-          apt-get install -y ghc alex happy
+          apt-get install -y ghc alex happy cabal-install
           cabal install Ranged-sets
         run: |
           (cd src/; alex -g Scan.x; happy -ag Parser.y)
